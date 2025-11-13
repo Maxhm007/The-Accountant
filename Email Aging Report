@@ -1,0 +1,1505 @@
+// @ts-nocheck
+/***** ======================= GLOBAL CONFIG ======================= *****/
+const SHEET_ID_WR         = '1wrBtf3C18NcfjghKaii2yqcvKwFs-qspjVxtJLidy7g';  // << Google Sheet ID
+const AR_SHEET_NAME       = 'AR';                                              // AR report tab
+const INVOICE_SHEET_NAME  = 'Invoices';                                        // exact
+const PAYMENTS_SHEET_NAME = 'Customer Payments';                               // exact
+const TIMEZONE            = 'Asia/Dhaka';
+
+// Email settings (one email with both PDFs attached)
+const RECIPIENTS           = 'accounts.manager@tuvat.com.bd'; // To
+const CC_RECIPIENTS        = '';                              // optional CC
+const EMAIL_SUBJECT_PREFIX = 'Weekly Aging Report and Analysis';
+
+// Save PDFs to Drive?
+const SAVE_TO_DRIVE   = false;  // true to also save PDFs
+const DRIVE_FOLDER_ID = 'PUT_DRIVE_FOLDER_ID_IF_SAVING';
+
+// AR tab print tuning (fit all columns on ONE A4 page; keep widths)
+const ENFORCE_MIN_FONT_PT   = 10; // optional
+const PRINT_DATA_FONT_PT    = 10; // AR data font
+const PRINT_HEADER_TITLE_PT = 14;
+const PRINT_HEADER_META_PT  = 10;
+
+// Analysis PDF layout options
+const REPORT_INCLUDE_CHARTS    = true;  // charts page visible
+const CHART_WIDTH_PX           = 620;   // legacy (not critical now)
+const CHARTS_PAGE_HEIGHT_PX    = 240;
+const CHART_VERTICAL_GAP_PX    = 18;
+const HEADER_ROW_HEIGHT_PX     = 20;
+const ROW_HEIGHT_PX            = 15;
+const NEXT_N_DAYS_FOR_EXP_CASH = 30;    // Expected Cash horizon
+
+// One-page charts layout (Charts sheet: 2x2 grid)
+const CHART_ITEM_WIDTH_PX    = 300;
+const CHART_ITEM_HEIGHT_PX   = 160;
+const CHART_ITEM_HEADER_H_PX = 18;
+const CHARTS_COL_SPACER_W    = 8;
+
+/***** ======================= MAIN ENTRY ======================= *****/
+/** Builds AR PDF + Analysis PDF, emails both in ONE message (and optionally saves to Drive).
+ *  Also embeds three HTML tables in the email body:
+ *  1) Aging Bucket Summary (same as PDF)
+ *  2) Weekly Collection Summary
+ *  3) Weekly Invoices
+ */
+function sendWeeklyAR_Bundle() {
+  try {
+    if (typeof buildAR === 'function') buildAR();
+  } catch (e) {
+    console.log('buildAR() skipped:', e && e.message);
+  }
+  if (ENFORCE_MIN_FONT_PT && ENFORCE_MIN_FONT_PT > 0) {
+    try { ensureMinFontSize_(); } catch (e) { console.log('ensureMinFontSize_ skipped:', e && e.message); }
+  }
+
+  const arPdf       = exportArTabToPdf_();          // A4 landscape
+  const analysisPdf = generateWeeklyAnalysisPdf_(); // A4 portrait
+
+  // Email body tables (includes Aging Bucket as #1)
+  const srcSS = SpreadsheetApp.openById(SHEET_ID_WR);
+  const emailHtmlBlocks = buildEmailWeeklyTables_(srcSS);
+  // { agingHTML, collectionsHTML, invoicesHTML, textAging, textCollections, textInvoices }
+
+  const stamp   = Utilities.formatDate(new Date(), TIMEZONE, 'dd-MMM-yyyy');
+  const subject = `${EMAIL_SUBJECT_PREFIX} — ${stamp}`;
+
+  // Plain-text fallback
+  const bodyText = [
+    'Dear Adeel,',
+    '',
+    'Please find the Weekly Aging Report & Analysis attached herewith.',
+    '',
+    '--- Aging Bucket Summary ---',
+    emailHtmlBlocks.textAging,
+    '',
+    '--- Weekly Collection Summary ---',
+    emailHtmlBlocks.textCollections,
+    '',
+    '--- Weekly Invoices ---',
+    emailHtmlBlocks.textInvoices,
+    '',
+    'Regards,',
+    'Mosharrof Hossain',
+    'Manager — Accounts & Credit Control'
+  ].join('\n');
+
+  // HTML body (NORMAL font size, Arial 13)
+  const htmlBody =
+    `<div style="font-family:Arial,Helvetica,sans-serif;font-size:13px;color:#222;line-height:1.4">
+      <p>Dear Adeel,</p>
+      <p>Please find the <strong>Weekly Aging Report</strong> and <strong>Analysis</strong> attached.</p>
+
+      <h3 style="margin:16px 0 8px 0;font-size:13px">1) Aging Bucket Summary</h3>
+      ${emailHtmlBlocks.agingHTML}
+
+      <h3 style="margin:16px 0 8px 0;font-size:13px">2) Weekly Collection Summary</h3>
+      ${emailHtmlBlocks.collectionsHTML}
+
+      <h3 style="margin:16px 0 8px 0;font-size:13px">3) Weekly Invoices</h3>
+      ${emailHtmlBlocks.invoicesHTML}
+
+      <p style="margin-top:16px">Regards,<br>
+      <strong>Mosharrof Hossain</strong><br>
+      Manager — Accounts &amp; Credit Control</p>
+    </div>`;
+
+  const mailOpts = {
+    to: RECIPIENTS,
+    subject,
+    body: bodyText,
+    htmlBody,
+    name: 'Mosharrof Hossain',
+    attachments: [arPdf, analysisPdf]
+  };
+  if (CC_RECIPIENTS) mailOpts.cc = CC_RECIPIENTS;
+
+  MailApp.sendEmail(mailOpts);
+
+  if (SAVE_TO_DRIVE) {
+    try {
+      const folder = DriveApp.getFolderById(DRIVE_FOLDER_ID);
+      folder.createFile(arPdf);
+      folder.createFile(analysisPdf);
+    } catch (e) {
+      console.log('SAVE_TO_DRIVE failed:', e && e.message);
+    }
+  }
+}
+
+/** Weekly trigger, Friday 9:15 AM. */
+function setupWeeklyTrigger_() {
+  deleteExistingTrigger_('sendWeeklyAR_Bundle');
+  ScriptApp.newTrigger('sendWeeklyAR_Bundle')
+    .timeBased().onWeekDay(ScriptApp.WeekDay.FRIDAY)
+    .atHour(9).nearMinute(15).inTimezone(TIMEZONE).create();
+}
+function deleteExistingTrigger_(fnName) {
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === fnName) ScriptApp.deleteTrigger(t);
+  });
+}
+
+/***** ======================= PART A: AR PDF (from AR tab) ======================= *****/
+function ensureMinFontSize_() {
+  const ss = SpreadsheetApp.openById(SHEET_ID_WR);
+  const sh = ss.getSheetByName(AR_SHEET_NAME);
+  if (!sh) throw new Error(`Sheet "${AR_SHEET_NAME}" not found.`);
+  sh.getDataRange().setFontSize(Math.max(ENFORCE_MIN_FONT_PT || 10, 8));
+}
+
+/** A4 landscape, narrow margins, fit ALL columns to one page width; header repeats; keep original column widths. */
+function exportArTabToPdf_() {
+  const ss  = SpreadsheetApp.openById(SHEET_ID_WR);
+  const src = ss.getSheetByName(AR_SHEET_NAME);
+  if (!src) throw new Error(`Sheet "${AR_SHEET_NAME}" not found.`);
+
+  const temp = src.copyTo(ss).setName(`_AR_Print_${Date.now()}`);
+  try {
+    try { temp.setFrozenColumns(0); } catch (e) {}
+    addPdfHeaderBlock_(temp);
+    optimizeForPrint_(temp);
+
+    const gid      = temp.getSheetId();
+    const fileName = `AR_${Utilities.formatDate(new Date(), TIMEZONE, 'yyyy-MM-dd')}.pdf`;
+
+    const exportUrl =
+      `https://docs.google.com/spreadsheets/d/${SHEET_ID_WR}/export?` +
+      `format=pdf&gid=${gid}&size=A4&portrait=false&fitw=true&scale=2&` +
+      `sheetnames=false&printtitle=false&pagenumbers=true&gridlines=false&fzr=true&` +
+      `top_margin=0.1&right_margin=0.1&bottom_margin=0.1&left_margin=0.1`;
+
+    const res = UrlFetchApp.fetch(exportUrl, {
+      headers: { Authorization: `Bearer ${ScriptApp.getOAuthToken()}` },
+      muteHttpExceptions: true
+    });
+    if (res.getResponseCode() !== 200) {
+      throw new Error(`Export failed: HTTP ${res.getResponseCode()} – ${res.getContentText()}`);
+    }
+    return res.getBlob().setName(fileName);
+  } finally {
+    try { ss.deleteSheet(temp); } catch (e) {}
+  }
+}
+
+/** 4-row header block; FREEZE 5 ROWS so table header (row 5) repeats on every page; keep columns unfrozen. */
+function addPdfHeaderBlock_(sh) {
+  const tz       = TIMEZONE || Session.getScriptTimeZone() || 'Asia/Dhaka';
+  const nowStamp = Utilities.formatDate(new Date(), tz, 'dd-MMM-yyyy hh:mm a');
+  const lastCol  = Math.max(1, sh.getLastColumn());
+
+  try { const f = sh.getFilter && sh.getFilter(); if (f) f.remove(); } catch (e) {}
+  try { sh.setFrozenRows(0); } catch (e) {}
+  try { sh.setFrozenColumns(0); } catch (e) {}
+
+  sh.insertRowsBefore(1, 4);
+  try { sh.getRange(1, 1, 4, lastCol).breakApart(); } catch (e) {}
+
+  sh.getRange(1, 1).setValue('TUV Austria Bangladesh - Debtors Aging Report');
+  sh.getRange(2, 1).setValue(`Generated On: ${nowStamp}`);
+  sh.getRange(3, 1).setValue('Prepared By: Mosharrof Hossain, Manager, Accounts & Credit Control');
+  sh.getRange(4, 1).setValue('');
+
+  sh.getRange(1, 1, 1, lastCol).mergeAcross();
+  sh.getRange(2, 1, 1, lastCol).mergeAcross();
+  sh.getRange(3, 1, 1, lastCol).mergeAcross();
+  sh.getRange(4, 1, 1, lastCol).mergeAcross();
+
+  sh.getRange(1, 1).setFontWeight('bold').setFontSize(PRINT_HEADER_TITLE_PT);
+  sh.getRange(2, 1, 2, 1).setFontWeight('normal').setFontSize(PRINT_HEADER_META_PT);
+  sh.getRange(1, 1, 3, 1).setHorizontalAlignment('center').setFontColor('#000000').setBackground(null);
+
+  sh.setRowHeight(1, 26);
+  sh.setRowHeight(2, 18);
+  sh.setRowHeight(3, 18);
+  sh.setRowHeight(4, 8);
+  sh.setFrozenRows(5);
+  try { sh.setFrozenColumns(0); } catch (e) {}
+}
+
+/** Increase fonts and keep widths + no wrapping */
+function optimizeForPrint_(sh) {
+  const lastRow = sh.getLastRow();
+  const lastCol = Math.max(1, sh.getLastColumn());
+  if (lastRow < 5) return;
+
+  sh.getRange(5, 1, lastRow - 4, lastCol).setFontSize(PRINT_DATA_FONT_PT);
+
+  const headerRow = sh.getRange(5, 1, 1, lastCol);
+  headerRow.setFontWeight('bold').setHorizontalAlignment('center').setWrap(false);
+  try { headerRow.setWrapStrategy(SpreadsheetApp.WrapStrategy.CLIP); } catch (e) {}
+
+  const dataRows = sh.getRange(6, 1, Math.max(0, lastRow - 5), lastCol);
+  if (dataRows.getNumRows() > 0) {
+    dataRows.setWrap(false);
+    try { dataRows.setWrapStrategy(SpreadsheetApp.WrapStrategy.CLIP); } catch (e) {}
+  }
+}
+
+/***** ======================= PART B: WEEKLY ANALYSIS PDF ======================= *****/
+function generateWeeklyAnalysisPdf_() {
+  const srcSS = SpreadsheetApp.openById(SHEET_ID_WR);
+
+  // === Read AR ===
+  const ar = srcSS.getSheetByName(AR_SHEET_NAME);
+  if (!ar) throw new Error(`Sheet "${AR_SHEET_NAME}" not found.`);
+  const lastRow = ar.getLastRow();
+  const lastCol = ar.getLastColumn();
+  if (lastRow < 2) throw new Error('AR has no data.');
+
+  const hdrRaw = ar.getRange(1,1,1,lastCol).getValues()[0];
+  const hdr    = hdrRaw.map(v => String(v).trim().toLowerCase());
+  const idxMulti = (names) => { for (const n of names) { const i = hdr.indexOf(n.toLowerCase()); if (i !== -1) return i; } return null; };
+
+  const iClient  = idxMulti(['client name','customer','customer name']);
+  const iSales   = idxMulti(['salesperson','salesperson name','sales person']);
+  const iAvgOD   = idxMulti(['dso','average od','avg od']);
+  const iDueAmt  = idxMulti(['due amount','balance','outstanding']);
+  const iExp     = idxMulti(['exp date','expected date','expected payment date']);
+  const i0_30    = idxMulti(['0- 30 days','0-30 days','0-30']);
+  const i31_60   = idxMulti(['31 - 60 days','31-60 days','31-60']);
+  const i61_90   = idxMulti(['61 - 90 days','61-90 days','61-90']);
+  const i91_180  = idxMulti(['91 - 180 days','91-180 days','91-180']);
+  const i181_365 = idxMulti(['181 - 365 days','181-365 days','181-365']);
+  const i1yr     = idxMulti(['1 year above','>365 days','365+']);
+  if ([iClient,iSales,iAvgOD,iDueAmt,iExp,i0_30,i31_60,i61_90,i91_180,i181_365,i1yr].some(v => v === null)) {
+    throw new Error('One or more required AR columns are missing. Please check AR headers.');
+  }
+
+  const values = ar.getRange(2,1,lastRow-1,lastCol).getValues();
+
+  // Helpers
+  const today = new Date(); today.setHours(0,0,0,0);
+  const toNum = v => (typeof v === 'number') ? v : Number(String(v ?? '').replace(/[, ]/g,'')) || 0;
+  const asDateOrNull = v => {
+    if (v instanceof Date) { const d=new Date(v); d.setHours(0,0,0,0); return isNaN(d)?null:d; }
+    const s = String(v ?? '').trim(); if (!s) return null;
+    const d = new Date(s); if (isNaN(d)) return null;
+    d.setHours(0,0,0,0); return d;
+  };
+  const fmtDdMmmYy = v => {
+    if (v instanceof Date) return Utilities.formatDate(v, TIMEZONE, 'dd-MMM-yy');
+    const d = asDateOrNull(v);
+    return d ? Utilities.formatDate(d, TIMEZONE, 'dd-MMM-yy') : String(v ?? '').trim();
+  };
+
+  // Aggregations (present)
+  let totalDueNow = 0, gt90Now = 0, clients = 0;
+  const buckets = { '0-30':0,'31-60':0,'61-90':0,'91-180':0,'181-365':0,'365+':0 };
+  const bucketStats = {
+    '0-30':   { amt:0, dsoSum:0, weight:0, clients: new Set() },
+    '31-60':  { amt:0, dsoSum:0, weight:0, clients: new Set() },
+    '61-90':  { amt:0, dsoSum:0, weight:0, clients: new Set() },
+    '91-180': { amt:0, dsoSum:0, weight:0, clients: new Set() },
+    '181-365':{ amt:0, dsoSum:0, weight:0, clients: new Set() },
+    '365+':   { amt:0, dsoSum:0, weight:0, clients: new Set() },
+  };
+  const bySales       = {};
+  const clientRowsAll = [];
+  const expCashMap    = {};
+
+  for (const r of values) {
+    const client = String(r[iClient] || '').trim();
+    if (!client || client.toUpperCase() === 'TOTAL') continue;
+
+    const salesRaw = String(r[iSales] || '').trim();
+    const sales    = salesRaw.replace(/\s+/g,' ');
+    const due      = toNum(r[iDueAmt]); if (due <= 0) continue;
+    const dso      = toNum(r[iAvgOD]);
+    const expRaw   = r[iExp];
+    const expD     = asDateOrNull(expRaw);
+
+    clients++;
+    totalDueNow += due;
+
+    const b0   = toNum(r[i0_30]);
+    const b31  = toNum(r[i31_60]);
+    const b61  = toNum(r[i61_90]);
+    const b91  = toNum(r[i91_180]);
+    const b181 = toNum(r[i181_365]);
+    const b1yr = toNum(r[i1yr]);
+
+    gt90Now += (b91 + b181 + b1yr);
+
+    buckets['0-30']    += b0;
+    buckets['31-60']   += b31;
+    buckets['61-90']   += b61;
+    buckets['91-180']  += b91;
+    buckets['181-365'] += b181;
+    buckets['365+']    += b1yr;
+
+    if (b0>0)   { bucketStats['0-30'].amt += b0;   bucketStats['0-30'].dsoSum += dso*b0;   bucketStats['0-30'].weight += dso>0?b0:0;   bucketStats['0-30'].clients.add(client); }
+    if (b31>0)  { bucketStats['31-60'].amt+= b31;  bucketStats['31-60'].dsoSum+= dso*b31;  bucketStats['31-60'].weight+= dso>0?b31:0;  bucketStats['31-60'].clients.add(client); }
+    if (b61>0)  { bucketStats['61-90'].amt+= b61;  bucketStats['61-90'].dsoSum+= dso*b61;  bucketStats['61-90'].weight+= dso>0?b61:0;  bucketStats['61-90'].clients.add(client); }
+    if (b91>0)  { bucketStats['91-180'].amt+= b91; bucketStats['91-180'].dsoSum+= dso*b91; bucketStats['91-180'].weight+= dso>0?b91:0; bucketStats['91-180'].clients.add(client); }
+    if (b181>0) { bucketStats['181-365'].amt+=b181;bucketStats['181-365'].dsoSum+=dso*b181;bucketStats['181-365'].weight+=dso>0?b181:0;bucketStats['181-365'].clients.add(client); }
+    if (b1yr>0) { bucketStats['365+'].amt += b1yr; bucketStats['365+'].dsoSum += dso*b1yr; bucketStats['365+'].weight += dso>0?b1yr:0;  bucketStats['365+'].clients.add(client); }
+
+    if (!isBadSalesLabel_(sales)) {
+      if (!bySales[sales]) bySales[sales] = {due:0, gt90:0, dsoWeightedSum:0, dsoWeight:0};
+      bySales[sales].due += due;
+      bySales[sales].gt90 += (b91 + b181 + b1yr);
+      if (dso > 0) {
+        bySales[sales].dsoWeightedSum += dso * due;
+        bySales[sales].dsoWeight      += due;
+      }
+    }
+
+    const pct90 = due > 0 ? (b91 + b181 + b1yr) / due : 0;
+    const risk  = riskLabel_(pct90, dso);
+    clientRowsAll.push([client, sales, Math.round(dso), due, pct90, risk, fmtDdMmmYy(expRaw)]);
+
+    if (expD && expD >= today && expD <= addDays_(today, NEXT_N_DAYS_FOR_EXP_CASH)) {
+      const key = Utilities.formatDate(expD, TIMEZONE, 'yyyy-MM-dd');
+      expCashMap[key] = (expCashMap[key] || 0) + due;
+    }
+  }
+
+  const weightedDSO = (() => {
+    let sum = 0, w = 0;
+    for (const row of clientRowsAll) {
+      const dso = row[2], due = row[3];
+      if (dso>0 && due>0) { sum += dso*due; w += due; }
+    }
+    return w > 0 ? Math.round(sum / w) : 0;
+  })();
+
+  // Salesperson summary rows
+  const salesRows = Object.keys(bySales).map(s => {
+    const rec = bySales[s]; if (!rec || rec.due <= 0) return null;
+    const wDso  = rec.dsoWeight > 0 ? Math.round(rec.dsoWeightedSum/rec.dsoWeight) : 0;
+    const pct90 = rec.due > 0 ? (rec.gt90/rec.due) : 0;
+    return [s, rec.due, rec.gt90, wDso, pct90, riskLabel_(pct90, wDso)];
+  }).filter(Boolean).sort((a,b)=> b[1]-a[1]);
+
+  const comboRows = salesRows
+    .filter(r => r[0] && !isBadSalesLabel_(r[0]) && r[1] > 0)
+    .map(a => [a[0], a[1], a[2], a[3]]); // name, Total, 90+, DSO
+
+  // === Build TEMP workbook ===
+  const tmpSS = SpreadsheetApp.create(`AR_Weekly_Analysis_TMP_${Utilities.formatDate(new Date(), TIMEZONE, 'yyyyMMdd_HHmmss')}`);
+  const rep   = tmpSS.getActiveSheet().setName('Report');
+
+  rep.getDataRange().setFontSize(9);
+  rep.setRowHeights(1, 300, 18);
+
+  let row = 1;
+  const nowStr = Utilities.formatDate(new Date(), TIMEZONE, "EEE, d-MMM-yyyy h:mm a");
+  rep.getRange(row,1,4,1).setValues([
+    ['TUV Austria Bangladesh — Weekly Collection and Debtor Analysis Report'],
+    [`Generated on: ${nowStr}`],
+    ['Prepared by: Mosharrof Hossain, Manager, Accounts and Credit Control'],
+    ['']
+  ]);
+  rep.getRange(row,1,1,1).setFontSize(16).setFontWeight('bold');
+  row += 4;
+
+  /* ===================== SECTION 1: Last 4 Weeks Collection Summary ===================== */
+  rep.getRange(row,1).setValue('1. Last 4 Weeks Collection Summary').setFontWeight('bold'); row++;
+
+  const wkRows   = buildWeeklyCollectionRows_SunSat_WithBack_(srcSS, totalDueNow, new Date());
+  const orderedW = [wkRows.weekMinus3, wkRows.weekMinus2, wkRows.lastWeek, wkRows.thisWeek];
+  const comps    = [wkRows.weekMinus4, wkRows.weekMinus3, wkRows.weekMinus2, wkRows.lastWeek];
+
+  for (let i = 0; i < orderedW.length; i++) {
+    const cur = orderedW[i];
+    const prev = comps[i];
+    if (prev && typeof prev.amount === 'number') {
+      if (prev.amount === 0) {
+        cur.pctChange = cur.amount > 0 ? 1 : 0;
+      } else {
+        cur.pctChange = (cur.amount - prev.amount) / prev.amount;
+      }
+      cur.remark = remarkLabel_(cur.pctChange, 'Improved', 'Decreased', 'Flat');
+    } else {
+      cur.pctChange = '';
+      cur.remark    = '—';
+    }
+  }
+
+  const totalAmt = orderedW.reduce((s, r) => s + (r.amount || 0), 0);
+  const dueBase  = orderedW[0]?.dueBefore || 0;
+  const totalPct = dueBase > 0 ? (totalAmt / dueBase) : 0;
+
+  const wkHdr = ['Weeks','Amount (BDT)','% of Total Due','% Changes','Remarks'];
+  rep.getRange(row,1,1,wkHdr.length).setValues([wkHdr]); styleHeader_(rep, row, wkHdr.length);
+
+  const outRows = orderedW.map(r => [
+    r.label,
+    Math.round(r.amount || 0),
+    (r.dueBefore > 0 ? (r.amount / r.dueBefore) : 0),
+    (r.pctChange === '' ? '' : r.pctChange),
+    r.remark || '—'
+  ]);
+  if (outRows.length) rep.getRange(row+1,1,outRows.length,wkHdr.length).setValues(outRows);
+
+  const totalRowA = ['TOTAL', Math.round(totalAmt), totalPct, '', '—'];
+  rep.getRange(row+1+outRows.length,1,1,wkHdr.length).setValues([totalRowA]).setFontWeight('bold');
+
+  const totalRowsCount = outRows.length + 1;
+  rep.getRange(row+1,2,totalRowsCount,1).setNumberFormat('#,##0');
+  rep.getRange(row+1,3,totalRowsCount,1).setNumberFormat('0%').setHorizontalAlignment('center').setVerticalAlignment('middle');
+  rep.getRange(row+1,4,outRows.length,1).setNumberFormat('0%').setHorizontalAlignment('center').setVerticalAlignment('middle');
+  addGridBorders_(rep.getRange(row,1,totalRowsCount+1,wkHdr.length));
+  row += totalRowsCount + 2;
+
+  /* ===================== SECTION 2: Aging Bucket Summary ===================== */
+  rep.getRange(row,1).setValue('2. Aging Bucket Summary').setFontWeight('bold'); row++;
+
+  const ninetyPlusAmt = buckets['91-180'] + buckets['181-365'] + buckets['365+'];
+  const ninetyPlusDsoSum = bucketStats['91-180'].dsoSum + bucketStats['181-365'].dsoSum + bucketStats['365+'].dsoSum;
+  const ninetyPlusWeight = bucketStats['91-180'].weight + bucketStats['181-365'].weight + bucketStats['365+'].weight;
+  const ninetyPlusClients = new Set([
+    ...bucketStats['91-180'].clients,
+    ...bucketStats['181-365'].clients,
+    ...bucketStats['365+'].clients
+  ]);
+
+  const orderB = ['0-30','31-60','61-90','90+'];
+  const abHdr  = ['Bucket','Amount (BDT)','% of Total','DSO','Clients No','Risk Analysis'];
+  const abRows = orderB.map(k => {
+    let amt=0, dsoW=0, share=0, nCli=0, risk='Low';
+    if (k === '90+') {
+      amt   = ninetyPlusAmt;
+      share = totalDueNow > 0 ? (amt/totalDueNow) : 0;
+      dsoW  = ninetyPlusWeight > 0 ? Math.round(ninetyPlusDsoSum / Math.max(ninetyPlusWeight,1)) : 0;
+      nCli  = ninetyPlusClients.size;
+      risk  = 'High';
+    } else {
+      const stat = bucketStats[k];
+      amt   = stat.amt;
+      share = totalDueNow > 0 ? (amt / totalDueNow) : 0;
+      dsoW  = stat.weight > 0 ? Math.round(stat.dsoSum / Math.max(stat.weight,1)) : 0;
+      nCli  = stat.clients.size;
+      risk  = (k === '61-90') ? 'Moderate' : (k === '31-60' ? 'Moderate' : 'Low');
+    }
+    const dsoRisk = riskLabel_(share, dsoW);
+    if (dsoRisk === 'Critical') risk = 'Critical';
+    else if (dsoRisk === 'High' && (risk === 'Low' || risk === 'Moderate')) risk = 'High';
+    return [k, amt, share, dsoW, nCli, risk];
+  });
+
+  const totalRow = [
+    'TOTAL',
+    totalDueNow,
+    totalDueNow>0?1:0,
+    weightedDSO,
+    clients,
+    riskLabel_(gt90Now/Math.max(totalDueNow || 1,1), weightedDSO)
+  ];
+
+  rep.getRange(row,1,1,abHdr.length).setValues([abHdr]); styleHeader_(rep, row, abHdr.length);
+  if (abRows.length) {
+    rep.getRange(row+1,1,abRows.length,abHdr.length).setValues(abRows);
+    rep.getRange(row+1+abRows.length,1,1,abHdr.length).setValues([totalRow]).setFontWeight('bold');
+  }
+  const abDataRows = abRows.length + 1;
+  if (abDataRows) {
+    rep.getRange(row+1,2,abDataRows,1).setNumberFormat('#,##0');
+    rep.getRange(row+1,3,abDataRows,1).setNumberFormat('0%').setHorizontalAlignment('center').setVerticalAlignment('middle');
+    rep.getRange(row+1,4,abDataRows,1).setNumberFormat('0').setHorizontalAlignment('center').setVerticalAlignment('middle');
+    rep.getRange(row+1,5,abDataRows,1).setNumberFormat('#,##0');
+    const abCommRange = rep.getRange(row+1,6,abDataRows,1);
+    const rulesAB = rep.getConditionalFormatRules();
+    rulesAB.push(
+      SpreadsheetApp.newConditionalFormatRule()
+        .whenTextEqualTo('Critical')
+        .setFontColor('#d00000')
+        .setRanges([abCommRange])
+        .build()
+    );
+    rep.setConditionalFormatRules(rulesAB);
+    addGridBorders_(rep.getRange(row,1,abDataRows+1,abHdr.length));
+  } else {
+    addGridBorders_(rep.getRange(row,1,1,abHdr.length));
+  }
+  row += (abRows.length || 0) + 3;
+
+  /* ===================== SECTION 3: Salesperson Summary ===================== */
+  rep.getRange(row,1).setValue('3. Salesperson Summary').setFontWeight('bold'); row++;
+  const spHdr = ['Salesperson','Total AR','90+','DSO','%90+','Risk'];
+  rep.getRange(row,1,1,spHdr.length).setValues([spHdr]); styleHeader_(rep, row, spHdr.length);
+  if (salesRows.length) rep.getRange(row+1,1,salesRows.length,spHdr.length).setValues(salesRows);
+  if (salesRows.length) {
+    rep.getRange(row+1,2,salesRows.length,1).setNumberFormat('#,##0');
+    rep.getRange(row+1,3,salesRows.length,1).setNumberFormat('#,##0');
+    rep.getRange(row+1,4,salesRows.length,1).setNumberFormat('0').setHorizontalAlignment('center').setVerticalAlignment('middle');
+    rep.getRange(row+1,5,salesRows.length,1).setNumberFormat('0%').setHorizontalAlignment('center').setVerticalAlignment('middle');
+    const riskRange = rep.getRange(row+1,6,salesRows.length,1);
+    const rulesA = rep.getConditionalFormatRules();
+    rulesA.push(
+      SpreadsheetApp.newConditionalFormatRule()
+        .whenTextEqualTo('Critical')
+        .setFontColor('#d00000')
+        .setRanges([riskRange])
+        .build()
+    );
+    rep.setConditionalFormatRules(rulesA);
+    addGridBorders_(rep.getRange(row,1,salesRows.length+1,spHdr.length));
+  } else {
+    addGridBorders_(rep.getRange(row,1,1,spHdr.length));
+  }
+  row += (salesRows.length || 0) + 2;
+
+  /* ===================== SECTION 4: Client-Level Insights ===================== */
+  rep.getRange(row,1).setValue('4. Client-Level Insights (Top 20 by Due)').setFontWeight('bold'); row++;
+  const cliHdr = ['Client Name','Salesperson','Due Amount','DSO','%90+','Risk Analysis','EXP Date'];
+  clientRowsAll.sort((a,b)=> b[3]-a[3]);
+  const clientRows = clientRowsAll.slice(0,20).map(r => [r[0], r[1], r[3], r[2], r[4], r[5], r[6]]);
+  rep.getRange(row,1,1,cliHdr.length).setValues([cliHdr]); styleHeader_(rep, row, cliHdr.length);
+  if (clientRows.length) rep.getRange(row+1,1,clientRows.length,cliHdr.length).setValues(clientRows);
+  if (clientRows.length) {
+    rep.getRange(row+1,3,clientRows.length,1).setNumberFormat('#,##0');
+    rep.getRange(row+1,4,clientRows.length,1).setNumberFormat('0').setHorizontalAlignment('center').setVerticalAlignment('middle');
+    rep.getRange(row+1,5,clientRows.length,1).setNumberFormat('0%').setHorizontalAlignment('center').setVerticalAlignment('middle');
+    rep.getRange(row+1,7,clientRows.length,1).setHorizontalAlignment('center').setVerticalAlignment('middle');
+    const riskRangeB = rep.getRange(row+1,6,clientRows.length,1);
+    const rulesB = rep.getConditionalFormatRules();
+    rulesB.push(
+      SpreadsheetApp.newConditionalFormatRule()
+        .whenTextEqualTo('Critical')
+        .setFontColor('#d00000')
+        .setRanges([riskRangeB])
+        .build()
+    );
+    rep.setConditionalFormatRules(rulesB);
+    addGridBorders_(rep.getRange(row,1,clientRows.length+1,cliHdr.length));
+  } else {
+    addGridBorders_(rep.getRange(row,1,1,cliHdr.length));
+  }
+
+  // Layout
+  rep.setColumnWidths(1, 1, 200);
+  rep.setColumnWidths(2, 1, 120);
+  rep.setColumnWidths(3, 1, 100);
+  rep.setColumnWidths(4, 1, 60);
+  rep.setColumnWidths(5, 1, 60);
+  rep.setColumnWidths(6, 1, 120);
+  rep.setColumnWidths(7, 1, 100);
+  rep.setFrozenRows(4);
+  rep.getDataRange().setWrap(false);
+
+  /***** ===== Charts sheet: ALL CHARTS ON ONE PAGE, WITH AGING PIE (no. 6) ===== *****/
+  const charts = tmpSS.insertSheet('Charts');
+  charts.clearFormats().clearContents();
+
+  const dataSheet = tmpSS.insertSheet('ChartData');
+  dataSheet.hideSheet();
+
+  // ---- Chart 5 data: Weekly collections (last 13 weeks) ----
+  const last13 = computeWeeklyCollectionsSunSat_(srcSS, new Date(), 13, true);
+  let c5Rows = [];
+  if (last13.length) {
+    const c5Hdr = ['Week Ending (Sat)','Collections (BDT)'];
+    dataSheet.getRange(1,1,1,c5Hdr.length).setValues([c5Hdr]);
+    c5Rows = last13.slice().reverse().map(w => {
+      const label = Utilities.formatDate(w.end, TIMEZONE, 'dd-MM-yyyy');
+      return [label, w.amount];
+    });
+    dataSheet.getRange(2,1,c5Rows.length,c5Hdr.length).setValues(c5Rows);
+    dataSheet.getRange(2,2,c5Rows.length,1).setNumberFormat('#,##0');
+  }
+
+  // ---- Chart 6 data: Aging Bucket Pie (0-30 / 31-60 / 61-90 / 90+) ----
+  const pieData = [
+    ['Bucket','Amount'],
+    ['0-30',  buckets['0-30']],
+    ['31-60', buckets['31-60']],
+    ['61-90', buckets['61-90']],
+    ['90+',   ninetyPlusAmt]
+  ];
+  const pieStartRow = 30;
+  dataSheet.getRange(pieStartRow,1,pieData.length,2).setValues(pieData);
+  dataSheet.getRange(pieStartRow+1,2,pieData.length-1,1).setNumberFormat('#,##0');
+
+  // ---- Chart 7 data: Outstanding by Sales + DSO ----
+  const combStartRow = 50;
+  const combHdr = ['Sales Person','Total Outstanding (bar)','90+ Outstanding (bar)','DSO (line)'];
+  dataSheet.getRange(combStartRow,1,1,combHdr.length).setValues([combHdr]);
+  if (comboRows.length) {
+    dataSheet.getRange(combStartRow+1,1,comboRows.length,combHdr.length).setValues(comboRows);
+    dataSheet.getRange(combStartRow+1,2,comboRows.length,2).setNumberFormat('#,##0');
+    dataSheet.getRange(combStartRow+1,4,comboRows.length,1).setNumberFormat('0');
+  }
+
+  // ---- Chart 8 data: Expected Cash (next N days) ----
+  const expStartRow = 80;
+  const expHdr = ['Date','Expected Cash'];
+  let expRows = [];
+  const expDays = Object.keys(expCashMap).sort();
+  dataSheet.getRange(expStartRow,1,1,2).setValues([expHdr]);
+  if (expDays.length) {
+    expRows = expDays.map(k => {
+      const d = new Date(k + 'T00:00:00');
+      const label = Utilities.formatDate(d, TIMEZONE, 'dd-MM-yyyy');
+      return [label, expCashMap[k]];
+    });
+    dataSheet.getRange(expStartRow+1,1,expRows.length,2).setValues(expRows);
+    dataSheet.getRange(expStartRow+1,2,expRows.length,1).setNumberFormat('#,##0');
+  }
+
+  // ---- Layout 2x2 grid on single page ----
+  charts.setColumnWidth(1, CHARTS_COL_SPACER_W);
+  charts.setColumnWidth(2, CHART_ITEM_WIDTH_PX);
+  charts.setColumnWidth(3, CHARTS_COL_SPACER_W);
+  charts.setColumnWidth(4, CHART_ITEM_WIDTH_PX);
+  charts.setColumnWidth(5, CHARTS_COL_SPACER_W);
+
+  let rTop = 1;
+  const rGap = 2 + Math.ceil(CHART_ITEM_HEIGHT_PX / ROW_HEIGHT_PX);
+
+  function placeHeader(text, rowH, col) {
+    charts.getRange(rowH, col-1)
+      .setValue(text)
+      .setFontSize(10)
+      .setFontWeight('bold')
+      .setHorizontalAlignment('left');
+    charts.setRowHeights(rowH, 1, CHART_ITEM_HEADER_H_PX);
+  }
+
+  // Chart 5: Collections Weekly (top-left)
+  if (c5Rows.length && REPORT_INCLUDE_CHARTS) {
+    placeHeader('5. Collections — Weekly (Last 3 Months)', rTop, 2);
+    const c5Range = dataSheet.getRange(1,1,c5Rows.length+1,2);
+    const chart5 = charts.newChart().asColumnChart()
+      .addRange(c5Range)
+      .setPosition(rTop+1, 2, 0, 0).setNumHeaders(1)
+      .setOption('useFirstColumnAsDomain', true)
+      .setOption('legend', { position: 'none' })
+      .setOption('width', CHART_ITEM_WIDTH_PX)
+      .setOption('height', CHART_ITEM_HEIGHT_PX)
+      .setOption('hAxis', { slantedText: true })
+      .build();
+    charts.insertChart(chart5);
+  }
+
+  // Chart 6: Aging Bucket Pie (top-right)
+  placeHeader('6. Aging Bucket — Share of Outstanding', rTop, 4);
+  const pieRange = dataSheet.getRange(pieStartRow,1,pieData.length,2);
+  const chart6 = charts.newChart().asPieChart()
+    .addRange(pieRange)
+    .setPosition(rTop+1, 4, 0, 0).setNumHeaders(1)
+    .setOption('legend', { position: 'right' })
+    .setOption('width', CHART_ITEM_WIDTH_PX)
+    .setOption('height', CHART_ITEM_HEIGHT_PX)
+    .build();
+  charts.insertChart(chart6);
+
+  // Move to bottom row for next charts
+  rTop += rGap;
+
+  // Chart 7: Sales + DSO (bottom-left)
+  placeHeader('7. Outstanding by Sales Person (Bars) + DSO (Line)', rTop, 2);
+  if (comboRows.length && REPORT_INCLUDE_CHARTS) {
+    const combRange = dataSheet.getRange(combStartRow,1,comboRows.length+1,4);
+    const chart7 = charts.newChart().asComboChart()
+      .addRange(combRange)
+      .setPosition(rTop+1, 2, 0, 0).setNumHeaders(1)
+      .setOption('useFirstColumnAsDomain', true)
+      .setOption('legend', { position: 'top' })
+      .setOption('width', CHART_ITEM_WIDTH_PX)
+      .setOption('height', CHART_ITEM_HEIGHT_PX)
+      .setOption('seriesType', 'bars')
+      .setOption('series', {
+        0: { type: 'bars', targetAxisIndex: 0 },
+        1: { type: 'bars', targetAxisIndex: 0 },
+        2: { type: 'line', targetAxisIndex: 1, lineWidth: 2, pointSize: 3 }
+      })
+      .setOption('vAxes', { 0: { title: 'Amount (BDT)' }, 1: { title: 'DSO (days)' } })
+      .build();
+    charts.insertChart(chart7);
+  }
+
+  // Chart 8: Expected Cash (bottom-right)
+  placeHeader(`8. Expected Cashflow (Next ${NEXT_N_DAYS_FOR_EXP_CASH} days)`, rTop, 4);
+  if (expRows.length && REPORT_INCLUDE_CHARTS) {
+    const expRange = dataSheet.getRange(expStartRow,1,expRows.length+1,2);
+    const chart8 = charts.newChart().asColumnChart()
+      .addRange(expRange)
+      .setPosition(rTop+1, 4, 0, 0).setNumHeaders(1)
+      .setOption('useFirstColumnAsDomain', true)
+      .setOption('legend', { position: 'none' })
+      .setOption('width', CHART_ITEM_WIDTH_PX)
+      .setOption('height', CHART_ITEM_HEIGHT_PX)
+      .setOption('hAxis', { slantedText: true })
+      .build();
+    charts.insertChart(chart8);
+  }
+
+  SpreadsheetApp.flush();
+  tmpSS.getSheets().forEach(sh => {
+    const n = sh.getName();
+    if (n !== 'Report' && n !== 'Charts') sh.hideSheet();
+  });
+
+  const pdfBlob = exportSheetsToPdf_All_({
+    spreadsheetId: tmpSS.getId(),
+    fileName: `Weekly_AR_Analysis_${Utilities.formatDate(new Date(), TIMEZONE, 'yyyy-MM-dd')}.pdf`,
+    landscape: false,
+    fitToWidth: true,
+    printGridlines: false,
+    pageSize: 'A4'
+  });
+
+  try { DriveApp.getFileById(tmpSS.getId()).setTrashed(true); } catch (e) {
+    console.warn('Temp file cleanup skipped:', e && e.message);
+  }
+  return pdfBlob;
+}
+
+/***** ======================= WEEKLY COLLECTION HELPERS (Sun→Sat) ======================= */
+function buildWeeklyCollectionRows_SunSat_WithBack_(srcSS, totalDueNow, now) {
+  const tz    = TIMEZONE || Session.getScriptTimeZone() || 'Asia/Dhaka';
+  const paySh = srcSS.getSheetByName(PAYMENTS_SHEET_NAME);
+  const invSh = srcSS.getSheetByName(INVOICE_SHEET_NAME);
+
+  // Payments (amount only)
+  let payRows = [];
+  if (paySh && paySh.getLastRow() >= 2) {
+    const plc = paySh.getLastColumn();
+    const PH  = paySh.getRange(1,1,1,plc).getValues()[0].map(s => String(s).trim().toLowerCase());
+    const pDate = PH.indexOf('date');
+    const pAmt  = PH.indexOf('amount');
+    if (pDate !== -1 && pAmt !== -1) {
+      const vals = paySh.getRange(2,1,paySh.getLastRow()-1,plc).getValues();
+      payRows = vals.map(r => ({
+        date: asDate0_(r[pDate]),
+        amt:  toNum_(r[pAmt])
+      })).filter(x => !!x.date && x.amt > 0);
+    }
+  }
+
+  // Invoices
+  let invRows = [];
+  if (invSh && invSh.getLastRow() >= 2) {
+    const ilc = invSh.getLastColumn();
+    const IH  = invSh.getRange(1,1,1,ilc).getValues()[0].map(s => String(s).trim().toLowerCase());
+    const iDate = IH.indexOf('date');
+    const tryCols = ['total','grand total','grand_total','invoice total','invoice_total','amount','total amount','total_amount','subtotal','sub_total','balance'];
+    let iTotal = -1;
+    for (const name of tryCols) {
+      const idx = IH.indexOf(name);
+      if (idx !== -1) { iTotal = idx; break; }
+    }
+    if (iDate !== -1 && iTotal !== -1) {
+      const vals = invSh.getRange(2,1,invSh.getLastRow()-1,ilc).getValues();
+      invRows = vals.map(r => ({
+        date: asDate0_(r[iDate]),
+        amt:  toNum_(r[iTotal])
+      })).filter(x => !!x.date && x.amt > 0);
+    }
+  }
+
+  const sunThis   = currentWeekSundayStart_(now, tz);
+  const wk1End    = addDaysEnd_(sunThis, -1);
+  const wk1Start  = addDays0_(wk1End, -6);
+  const wk2End    = addDaysEnd_(wk1End, -7);
+  const wk2Start  = addDays0_(wk2End, -6);
+  const wk3End    = addDaysEnd_(wk2End, -7);
+  const wk3Start  = addDays0_(wk3End, -6);
+  const wk4End    = addDaysEnd_(wk3End, -7);
+  const wk4Start  = addDays0_(wk4End, -6);
+
+  const sumInWindow = (rows, start, end) => {
+    const s = start.getTime(), e = end.getTime();
+    let sum = 0;
+    for (const r of rows) {
+      const t = r.date.getTime();
+      if (t >= s && t <= e) sum += Math.max(0, r.amt);
+    }
+    return sum;
+  };
+
+  const invPartial = sumInWindow(invRows, sunThis, now);
+  const payPartial = sumInWindow(payRows, sunThis, now);
+  let dueAt_wk1End = Math.max(0, Math.round(totalDueNow - invPartial + payPartial));
+
+  function rowFor(start, end, dueEndAfterWindow) {
+    const inv  = sumInWindow(invRows, start, end);
+    const pay  = sumInWindow(payRows, start, end);
+    const dueBefore = Math.max(0, Math.round(dueEndAfterWindow - inv + pay));
+    const amount    = Math.round(pay);
+    const label = 'From ' + Utilities.formatDate(start, tz, 'dd-MMM-yy') +
+                  ' to ' + Utilities.formatDate(end, tz, 'dd-MMM-yy');
+    return { label, start, end, amount, dueBefore };
+  }
+
+  const lastWeek   = rowFor(wk1Start, wk1End, dueAt_wk1End);
+  const weekMinus2 = rowFor(wk2Start, wk2End, lastWeek.dueBefore);
+  const weekMinus3 = rowFor(wk3Start, wk3End, weekMinus2.dueBefore);
+  const weekMinus4 = rowFor(wk4Start, wk4End, weekMinus3.dueBefore);
+
+  const dueAtSunThis = Math.max(0,
+    Math.round(dueAt_wk1End - sumInWindow(invRows, wk1Start, wk1End) + sumInWindow(payRows, wk1Start, wk1End))
+  );
+  const thisAmount = Math.round(sumInWindow(payRows, sunThis, now));
+  const thisLabel  = 'From ' + Utilities.formatDate(sunThis, tz, 'dd-MMM-yy') +
+                     ' to ' + Utilities.formatDate(now, tz, 'dd-MMM-yy');
+  const thisWeek   = { label: thisLabel, start: sunThis, end: now, amount: thisAmount, dueBefore: dueAtSunThis };
+
+  return { thisWeek, lastWeek, weekMinus2, weekMinus3, weekMinus4 };
+
+  function toNum_(v){ return (typeof v === 'number') ? v : Number(String(v ?? '').replace(/[, ]/g,'')) || 0; }
+  function asDate0_(v){
+    if (v instanceof Date){ const d=new Date(v); d.setHours(0,0,0,0); return isNaN(d)?null:d; }
+    const s=String(v??'').trim(); if(!s) return null;
+    const d=new Date(s); if (isNaN(d)) return null;
+    d.setHours(0,0,0,0); return d;
+  }
+  function addDays0_(d, n){ const x=new Date(d); x.setDate(x.getDate()+n); x.setHours(0,0,0,0); return x; }
+  function addDaysEnd_(d, n){ const x=new Date(d); x.setDate(x.getDate()+n); x.setHours(23,59,59,999); return x; }
+  function currentWeekSundayStart_(now, tz){
+    const y = Utilities.formatDate(now, tz, 'yyyy');
+    const m = Utilities.formatDate(now, tz, 'MM');
+    const dd = Utilities.formatDate(now, tz, 'dd');
+    const localMid = new Date(`${y}-${m}-${dd}T00:00:00`);
+    const u = Number(Utilities.formatDate(localMid, tz, 'u')); // 1..7 Mon..Sun
+    const dow = (u % 7); // Sun=0..Sat=6
+    const back = (dow >= 0) ? dow : 0;
+    localMid.setDate(localMid.getDate() - back);
+    const y2 = Utilities.formatDate(localMid, tz, 'yyyy');
+    const m2 = Utilities.formatDate(localMid, tz, 'MM');
+    const d2 = Utilities.formatDate(localMid, tz, 'dd');
+    return new Date(`${y2}-${m2}-${d2}T00:00:00`);
+  }
+}
+
+function computeWeeklyCollectionsSunSat_(srcSS, now, n = 13, includeCurrent = false) {
+  const tz    = TIMEZONE || Session.getScriptTimeZone() || 'Asia/Dhaka';
+  const paySh = srcSS.getSheetByName(PAYMENTS_SHEET_NAME);
+  if (!paySh || paySh.getLastRow() < 2) return [];
+
+  const plc = paySh.getLastColumn();
+  const PH  = paySh.getRange(1,1,1,plc).getValues()[0].map(s => String(s).trim().toLowerCase());
+  const pDate = PH.indexOf('date');
+  const pAmt  = PH.indexOf('amount');
+  if (pDate === -1 || pAmt === -1) return [];
+
+  const vals = paySh.getRange(2,1,paySh.getLastRow()-1,plc).getValues();
+  const rows = vals.map(r => ({
+    date: asDate0_(r[pDate]),
+    amt:  toNum_(r[pAmt])
+  })).filter(x => !!x.date && x.amt > 0);
+
+  const sunThis   = currentWeekSundayStart_(now, tz);
+  const lastSatEnd = addDaysEnd_(sunThis, -1);
+
+  const weeks = [];
+  let end = includeCurrent ? addDaysEnd_(sunThis, 6) : lastSatEnd;
+
+  for (let i=0; i<n; i++) {
+    const start = addDays0_(end, -6);
+    const s = start.getTime(), e = end.getTime();
+    let sum = 0;
+    for (const r of rows) {
+      const t = r.date.getTime();
+      if (t >= s && t <= e) sum += Math.max(0, r.amt);
+    }
+    weeks.push({ start, end, amount: Math.round(sum) });
+    end = addDaysEnd_(end, -7);
+  }
+  return weeks;
+
+  function toNum_(v){ return (typeof v === 'number') ? v : Number(String(v ?? '').replace(/[, ]/g,'')) || 0; }
+  function asDate0_(v){
+    if (v instanceof Date){ const d=new Date(v); d.setHours(0,0,0,0); return isNaN(d)?null:d; }
+    const s=String(v??'').trim(); if(!s) return null;
+    const d=new Date(s); if (isNaN(d)) return null;
+    d.setHours(0,0,0,0); return d;
+  }
+  function addDays0_(d, n){ const x=new Date(d); x.setDate(x.getDate()+n); x.setHours(0,0,0,0); return x; }
+  function addDaysEnd_(d, n){ const x=new Date(d); x.setDate(x.getDate()+n); x.setHours(23,59,59,999); return x; }
+  function currentWeekSundayStart_(now, tz){
+    const y = Utilities.formatDate(now, tz, 'yyyy');
+    const m = Utilities.formatDate(now, tz, 'MM');
+    const dd = Utilities.formatDate(now, tz, 'dd');
+    const localMid = new Date(`${y}-${m}-${dd}T00:00:00`);
+    const u = Number(Utilities.formatDate(localMid, tz, 'u'));
+    const dow = (u % 7);
+    const back = (dow >= 0) ? dow : 0;
+    localMid.setDate(localMid.getDate() - back);
+    const y2 = Utilities.formatDate(localMid, tz, 'yyyy');
+    const m2 = Utilities.formatDate(localMid, tz, 'MM');
+    const d2 = Utilities.formatDate(localMid, tz, 'dd');
+    return new Date(`${y2}-${m2}-${d2}T00:00:00`);
+  }
+}
+
+/***** ======================= PRIOR SNAPSHOT (kept as-is) ======================= */
+function buildLastWeekFromInvoices_SNAPSHOT_(srcSS) {
+  const sh = srcSS.getSheetByName(INVOICE_SHEET_NAME);
+  if (!sh) return { available:false };
+
+  const lr = sh.getLastRow(), lc = sh.getLastColumn();
+  if (lr < 2) return { available:false };
+
+  const H = sh.getRange(1,1,1,lc).getValues()[0].map(v => String(v).trim().toLowerCase());
+  const iInvDt = H.indexOf('date');
+  const iPayDt = H.indexOf('last_payment_date');
+  const iBal   = H.indexOf('balance');
+  const iCust  = H.indexOf('customer_name');
+  if (iInvDt === -1 || iBal === -1) return { available:false };
+
+  const asOf = mostRecentThursdayEnd_(new Date(), TIMEZONE);
+
+  const vals = sh.getRange(2,1,lr-1,lc).getValues();
+  let total=0, gt90=0, wDsoSum=0, wDsoW=0;
+  const clientsSet=new Set();
+
+  const toDate0 = (v) => {
+    if (v instanceof Date) { const d=new Date(v); d.setHours(0,0,0,0); return isNaN(d)?null:d; }
+    const s=String(v??'').trim(); if(!s) return null;
+    const d=new Date(s); if(isNaN(d)) return null;
+    d.setHours(0,0,0,0); return d;
+  };
+  const toNum = (v) => (typeof v==='number') ? v : Number(String(v??'').replace(/[, ]/g,''))||0;
+
+  for (const r of vals) {
+    const bal = Math.max(0, toNum(r[iBal]));
+    if (bal <= 0) continue;
+
+    const invD = toDate0(r[iInvDt]);
+    if (!invD || invD.getTime() > asOf.getTime()) continue;
+
+    const lastPay = toDate0(r[iPayDt]);
+    if (lastPay && lastPay.getTime() <= asOf.getTime()) continue;
+
+    total += bal;
+
+    const od = Math.max(0, Math.round((asOf - invD)/(1000*60*60*24)));
+    if (od > 90) gt90 += bal;
+    if (od > 0) { wDsoSum += od * bal; wDsoW += bal; }
+
+    if (iCust !== -1) {
+      const name = String(r[iCust] || '').trim();
+      if (name) clientsSet.add(name);
+    } else {
+      clientsSet.add('row-' + clientsSet.size);
+    }
+  }
+
+  if (total === 0 && wDsoW === 0) return { available:false };
+
+  const wDso = wDsoW>0 ? Math.round(wDsoSum/wDsoW) : 0;
+  return {
+    available:true,
+    date: asOf,
+    totalDue: Math.round(total),
+    gt90: Math.round(gt90),
+    weightedDSO: wDso,
+    clients: clientsSet.size
+  };
+}
+
+/***** ======================= EMAIL BODY HELPERS ======================= */
+// Re-usable AR stats for Aging Bucket (same logic as PDF)
+function computeAgingBucketForEmail_(srcSS) {
+  const ar = srcSS.getSheetByName(AR_SHEET_NAME);
+  if (!ar || ar.getLastRow() < 2) {
+    return {
+      totalDueNow: 0,
+      buckets: { '0-30':0,'31-60':0,'61-90':0,'91-180':0,'181-365':0,'365+':0 },
+      bucketStats: {
+        '0-30':{amt:0,dsoSum:0,weight:0,clients:new Set()},
+        '31-60':{amt:0,dsoSum:0,weight:0,clients:new Set()},
+        '61-90':{amt:0,dsoSum:0,weight:0,clients:new Set()},
+        '91-180':{amt:0,dsoSum:0,weight:0,clients:new Set()},
+        '181-365':{amt:0,dsoSum:0,weight:0,clients:new Set()},
+        '365+':{amt:0,dsoSum:0,weight:0,clients:new Set()}
+      },
+      ninetyPlusAmt: 0,
+      ninetyPlusDsoSum: 0,
+      ninetyPlusWeight: 0,
+      ninetyPlusClients: new Set(),
+      weightedDSO: 0,
+      clients: 0,
+      gt90Now: 0
+    };
+  }
+
+  const lastRow = ar.getLastRow();
+  const lastCol = ar.getLastColumn();
+  const hdrRaw  = ar.getRange(1,1,1,lastCol).getValues()[0];
+  const hdr     = hdrRaw.map(v => String(v).trim().toLowerCase());
+  const idxMulti = (names) => { for (const n of names) { const i = hdr.indexOf(n.toLowerCase()); if (i !== -1) return i; } return null; };
+
+  const iClient  = idxMulti(['client name','customer','customer name']);
+  const iAvgOD   = idxMulti(['dso','average od','avg od']);
+  const iDueAmt  = idxMulti(['due amount','balance','outstanding']);
+  const i0_30    = idxMulti(['0- 30 days','0-30 days','0-30']);
+  const i31_60   = idxMulti(['31 - 60 days','31-60 days','31-60']);
+  const i61_90   = idxMulti(['61 - 90 days','61-90 days','61-90']);
+  const i91_180  = idxMulti(['91 - 180 days','91-180 days','91-180']);
+  const i181_365 = idxMulti(['181 - 365 days','181-365 days','181-365']);
+  const i1yr     = idxMulti(['1 year above','>365 days','365+']);
+  if ([iClient,iAvgOD,iDueAmt,i0_30,i31_60,i61_90,i91_180,i181_365,i1yr].some(v => v === null)) {
+    return {
+      totalDueNow: 0,
+      buckets: { '0-30':0,'31-60':0,'61-90':0,'91-180':0,'181-365':0,'365+':0 },
+      bucketStats: {
+        '0-30':{amt:0,dsoSum:0,weight:0,clients:new Set()},
+        '31-60':{amt:0,dsoSum:0,weight:0,clients:new Set()},
+        '61-90':{amt:0,dsoSum:0,weight:0,clients:new Set()},
+        '91-180':{amt:0,dsoSum:0,weight:0,clients:new Set()},
+        '181-365':{amt:0,dsoSum:0,weight:0,clients:new Set()},
+        '365+':{amt:0,dsoSum:0,weight:0,clients:new Set()}
+      },
+      ninetyPlusAmt: 0,
+      ninetyPlusDsoSum: 0,
+      ninetyPlusWeight: 0,
+      ninetyPlusClients: new Set(),
+      weightedDSO: 0,
+      clients: 0,
+      gt90Now: 0
+    };
+  }
+
+  const values = ar.getRange(2,1,lastRow-1,lastCol).getValues();
+  const toNum = v => (typeof v === 'number') ? v : Number(String(v ?? '').replace(/[, ]/g,'')) || 0;
+
+  let totalDueNow = 0, gt90Now = 0, clients = 0;
+  const buckets = { '0-30':0,'31-60':0,'61-90':0,'91-180':0,'181-365':0,'365+':0 };
+  const bucketStats = {
+    '0-30':   { amt:0, dsoSum:0, weight:0, clients: new Set() },
+    '31-60':  { amt:0, dsoSum:0, weight:0, clients: new Set() },
+    '61-90':  { amt:0, dsoSum:0, weight:0, clients: new Set() },
+    '91-180': { amt:0, dsoSum:0, weight:0, clients: new Set() },
+    '181-365':{ amt:0, dsoSum:0, weight:0, clients: new Set() },
+    '365+':   { amt:0, dsoSum:0, weight:0, clients: new Set() },
+  };
+  const clientRowsAll = [];
+
+  for (const r of values) {
+    const client = String(r[iClient] || '').trim();
+    if (!client || client.toUpperCase() === 'TOTAL') continue;
+
+    const due = toNum(r[iDueAmt]); if (due <= 0) continue;
+    const dso = toNum(r[iAvgOD]);
+
+    clients++;
+    totalDueNow += due;
+
+    const b0   = toNum(r[i0_30]);
+    const b31  = toNum(r[i31_60]);
+    const b61  = toNum(r[i61_90]);
+    const b91  = toNum(r[i91_180]);
+    const b181 = toNum(r[i181_365]);
+    const b1yr = toNum(r[i1yr]);
+
+    gt90Now += (b91 + b181 + b1yr);
+
+    buckets['0-30']    += b0;
+    buckets['31-60']   += b31;
+    buckets['61-90']   += b61;
+    buckets['91-180']  += b91;
+    buckets['181-365'] += b181;
+    buckets['365+']    += b1yr;
+
+    if (b0>0)   { bucketStats['0-30'].amt += b0;   bucketStats['0-30'].dsoSum += dso*b0;   bucketStats['0-30'].weight += dso>0?b0:0;   bucketStats['0-30'].clients.add(client); }
+    if (b31>0)  { bucketStats['31-60'].amt+= b31;  bucketStats['31-60'].dsoSum+= dso*b31;  bucketStats['31-60'].weight+= dso>0?b31:0;  bucketStats['31-60'].clients.add(client); }
+    if (b61>0)  { bucketStats['61-90'].amt+= b61;  bucketStats['61-90'].dsoSum+= dso*b61;  bucketStats['61-90'].weight+= dso>0?b61:0;  bucketStats['61-90'].clients.add(client); }
+    if (b91>0)  { bucketStats['91-180'].amt+= b91; bucketStats['91-180'].dsoSum+= dso*b91; bucketStats['91-180'].weight+= dso>0?b91:0; bucketStats['91-180'].clients.add(client); }
+    if (b181>0) { bucketStats['181-365'].amt+=b181;bucketStats['181-365'].dsoSum+=dso*b181;bucketStats['181-365'].weight+=dso>0?b181:0;bucketStats['181-365'].clients.add(client); }
+    if (b1yr>0) { bucketStats['365+'].amt += b1yr; bucketStats['365+'].dsoSum += dso*b1yr; bucketStats['365+'].weight += dso>0?b1yr:0;  bucketStats['365+'].clients.add(client); }
+
+    clientRowsAll.push({ dso, due });
+  }
+
+  // weighted DSO (same logic as PDF)
+  let sum = 0, w = 0;
+  for (const row of clientRowsAll) {
+    if (row.dso>0 && row.due>0) { sum += row.dso*row.due; w += row.due; }
+  }
+  const weightedDSO = w>0 ? Math.round(sum/w) : 0;
+
+  const ninetyPlusAmt = buckets['91-180'] + buckets['181-365'] + buckets['365+'];
+  const ninetyPlusDsoSum = bucketStats['91-180'].dsoSum + bucketStats['181-365'].dsoSum + bucketStats['365+'].dsoSum;
+  const ninetyPlusWeight = bucketStats['91-180'].weight + bucketStats['181-365'].weight + bucketStats['365+'].weight;
+  const ninetyPlusClients = new Set([
+    ...bucketStats['91-180'].clients,
+    ...bucketStats['181-365'].clients,
+    ...bucketStats['365+'].clients
+  ]);
+
+  return {
+    totalDueNow,
+    buckets,
+    bucketStats,
+    ninetyPlusAmt,
+    ninetyPlusDsoSum,
+    ninetyPlusWeight,
+    ninetyPlusClients,
+    weightedDSO,
+    clients,
+    gt90Now
+  };
+}
+
+// HTML tables: Arial 13, red header, BLACK borders
+function buildEmailWeeklyTables_(srcSS) {
+  // ----- Aging Bucket (same structure as PDF) -----
+  const arStats = computeAgingBucketForEmail_(srcSS);
+  const {
+    totalDueNow,
+    buckets,
+    bucketStats,
+    ninetyPlusAmt,
+    ninetyPlusDsoSum,
+    ninetyPlusWeight,
+    ninetyPlusClients,
+    weightedDSO,
+    clients,
+    gt90Now
+  } = arStats;
+
+  const orderB = ['0-30','31-60','61-90','90+'];
+  const abHdr  = ['Bucket','Amount (BDT)','% of Total','DSO','Clients No','Risk Analysis'];
+
+  const abRows = orderB.map(k => {
+    let amt=0, dsoW=0, share=0, nCli=0, risk='Low';
+    if (k === '90+') {
+      amt   = ninetyPlusAmt;
+      share = totalDueNow > 0 ? (amt/totalDueNow) : 0;
+      dsoW  = ninetyPlusWeight > 0 ? Math.round(ninetyPlusDsoSum / Math.max(ninetyPlusWeight,1)) : 0;
+      nCli  = ninetyPlusClients.size;
+      risk  = 'High';
+    } else {
+      const stat = bucketStats[k];
+      amt   = stat.amt;
+      share = totalDueNow > 0 ? (amt / totalDueNow) : 0;
+      dsoW  = stat.weight > 0 ? Math.round(stat.dsoSum / Math.max(stat.weight,1)) : 0;
+      nCli  = stat.clients.size;
+      risk  = (k === '61-90') ? 'Moderate' : (k === '31-60' ? 'Moderate' : 'Low');
+    }
+    const dsoRisk = riskLabel_(share, dsoW);
+    if (dsoRisk === 'Critical') risk = 'Critical';
+    else if (dsoRisk === 'High' && (risk === 'Low' || risk === 'Moderate')) risk = 'High';
+    return { bucket:k, amt, share, dsoW, nCli, risk };
+  });
+
+  const totalRow = {
+    bucket: 'TOTAL',
+    amt: totalDueNow,
+    share: totalDueNow>0?1:0,
+    dsoW: weightedDSO,
+    nCli: clients,
+    risk: riskLabel_(gt90Now/Math.max(totalDueNow || 1,1), weightedDSO)
+  };
+
+  // ----- Weekly Collections (needs totalDueNow from AR) -----
+  const coll = buildWeeklyCollectionRows_SunSat_WithBack_(srcSS, totalDueNow, new Date());
+  const ordered = [coll.weekMinus3, coll.weekMinus2, coll.lastWeek, coll.thisWeek];
+  const comparators = [coll.weekMinus4, coll.weekMinus3, coll.weekMinus2, coll.lastWeek];
+
+  for (let i=0;i<ordered.length;i++){
+    const cur = ordered[i], prev = comparators[i];
+    if (prev && typeof prev.amount === 'number') {
+      if (prev.amount === 0) cur.pctChange = cur.amount > 0 ? 1 : 0;
+      else cur.pctChange = (cur.amount - prev.amount) / prev.amount;
+      cur.remark = remarkLabel_(cur.pctChange, 'Improved', 'Decreased', 'Flat');
+    } else {
+      cur.pctChange = '';
+      cur.remark    = '—';
+    }
+  }
+
+  const totalAmt = ordered.reduce((s,r)=>s+(r.amount||0),0);
+  const dueBase  = ordered[0]?.dueBefore || 0;
+  const totalPct = dueBase>0 ? (totalAmt/dueBase) : 0;
+
+  // ----- Weekly Invoices -----
+  const invoiceRows = computeWeeklyInvoicesSunSat_(srcSS, new Date(), 4, true);
+  const invOrdered  = invoiceRows.slice().reverse();
+
+  // ----- CSS (NORMAL font, Arial 13, BLACK borders) -----
+  const cssTable   = "border-collapse:collapse;width:100%;max-width:720px;font-family:Arial,Helvetica,sans-serif;font-size:13px;border:1px solid #000000";
+  const cssTh      = "background:#ff0000;color:#ffffff;border:1px solid #000000;padding:6px 8px;text-align:center;font-weight:bold;font-family:Arial,Helvetica,sans-serif;font-size:13px";
+  const cssTdLeft  = "border:1px solid #000000;padding:6px 8px;text-align:left;font-family:Arial,Helvetica,sans-serif;font-size:13px";
+  const cssTdRight = "border:1px solid #000000;padding:6px 8px;text-align:right;font-family:Arial,Helvetica,sans-serif;font-size:13px";
+  const cssTdCenter= "border:1px solid #000000;padding:6px 8px;text-align:center;font-family:Arial,Helvetica,sans-serif;font-size:13px";
+
+  // ----- Aging Bucket HTML -----
+  const agingHeaderHTML = `
+    <tr>
+      <th style="${cssTh}">Bucket</th>
+      <th style="${cssTh}">Amount (BDT)</th>
+      <th style="${cssTh}">% of Total</th>
+      <th style="${cssTh}">DSO</th>
+      <th style="${cssTh}">Clients No</th>
+      <th style="${cssTh}">Risk Analysis</th>
+    </tr>`;
+
+  const agingRowsHTML = abRows.map(r => `
+    <tr>
+      <td style="${cssTdCenter}">${r.bucket}</td>
+      <td style="${cssTdRight}">${fmtBDT_(r.amt)}</td>
+      <td style="${cssTdCenter}">${fmtPct_(r.share)}</td>
+      <td style="${cssTdCenter}">${r.dsoW || 0}</td>
+      <td style="${cssTdCenter}">${r.nCli}</td>
+      <td style="${cssTdCenter}">${r.risk}</td>
+    </tr>`).join('');
+
+  const agingTotalHTML = `
+    <tr>
+      <td style="${cssTdCenter};font-weight:bold">${totalRow.bucket}</td>
+      <td style="${cssTdRight};font-weight:bold">${fmtBDT_(totalRow.amt)}</td>
+      <td style="${cssTdCenter};font-weight:bold">${fmtPct_(totalRow.share)}</td>
+      <td style="${cssTdCenter};font-weight:bold">${totalRow.dsoW}</td>
+      <td style="${cssTdCenter};font-weight:bold">${totalRow.nCli}</td>
+      <td style="${cssTdCenter};font-weight:bold">${totalRow.risk}</td>
+    </tr>`;
+
+  const agingHTML = `<table style="${cssTable}">${agingHeaderHTML}${agingRowsHTML}${agingTotalHTML}</table>`;
+
+  const textAgingLines = abRows.map(r =>
+    `${r.bucket} | Amount: ${fmtBDT_plain_(r.amt)} | % of Total: ${fmtPct_plain_(r.share)} | DSO: ${r.dsoW || 0} | Clients: ${r.nCli} | Risk: ${r.risk}`
+  ).concat([
+    `${totalRow.bucket} | Amount: ${fmtBDT_plain_(totalRow.amt)} | % of Total: ${fmtPct_plain_(totalRow.share)} | DSO: ${totalRow.dsoW} | Clients: ${totalRow.nCli} | Risk: ${totalRow.risk}`
+  ]);
+  const textAging = textAgingLines.join('\n');
+
+  // ----- Collections HTML -----
+  const collHeader = `
+    <tr>
+      <th style="${cssTh}">Weeks</th>
+      <th style="${cssTh}">Amount (BDT)</th>
+      <th style="${cssTh}">% of Total Due</th>
+      <th style="${cssTh}">% Changes</th>
+      <th style="${cssTh}">Remarks</th>
+    </tr>`;
+  const collRowsHTML = ordered.map(r => `
+    <tr>
+      <td style="${cssTdLeft}">${r.label}</td>
+      <td style="${cssTdRight}">${fmtBDT_(r.amount || 0)}</td>
+      <td style="${cssTdCenter}">${fmtPct_(r.dueBefore > 0 ? (r.amount / r.dueBefore) : '')}</td>
+      <td style="${cssTdCenter}">${fmtPct_(r.pctChange === '' ? '' : r.pctChange)}</td>
+      <td style="${cssTdCenter}">${r.remark || '—'}</td>
+    </tr>`).join('');
+  const collTotalHTML = `
+    <tr>
+      <td style="${cssTdLeft};font-weight:bold">TOTAL</td>
+      <td style="${cssTdRight};font-weight:bold">${fmtBDT_(totalAmt)}</td>
+      <td style="${cssTdCenter};font-weight:bold">${fmtPct_(totalPct)}</td>
+      <td style="${cssTdCenter}">—</td>
+      <td style="${cssTdCenter}">—</td>
+    </tr>`;
+  const collectionsHTML = `<table style="${cssTable}">${collHeader}${collRowsHTML}${collTotalHTML}</table>`;
+
+  // text for collections
+  const textCollections = ordered.map(r =>
+    `${r.label} | Amount: ${fmtBDT_plain_(r.amount || 0)} | % of Due: ${fmtPct_plain_(r.dueBefore > 0 ? (r.amount / r.dueBefore) : '')} | % Change: ${fmtPct_plain_(r.pctChange === '' ? '' : r.pctChange)} | ${r.remark || '—'}`
+  ).concat([`TOTAL | ${fmtBDT_plain_(totalAmt)} | ${fmtPct_plain_(totalPct)}`]).join('\n');
+
+  // ----- Invoices HTML -----
+  const invHeader = `
+    <tr>
+      <th style="${cssTh}">Weeks</th>
+      <th style="${cssTh}">Invoices (BDT)</th>
+    </tr>`;
+  const invRowsHTML = invOrdered.map(w => `
+    <tr>
+      <td style="${cssTdLeft}">${w.label}</td>
+      <td style="${cssTdRight}">${fmtBDT_(w.amount || 0)}</td>
+    </tr>`).join('');
+  const invoicesHTML = `<table style="${cssTable}">${invHeader}${invRowsHTML}</table>`;
+
+  const textInvoices = invOrdered.map(w =>
+    `${w.label} | Invoices: ${fmtBDT_plain_(w.amount || 0)}`
+  ).join('\n');
+
+  return {
+    agingHTML,
+    collectionsHTML,
+    invoicesHTML,
+    textAging,
+    textCollections,
+    textInvoices
+  };
+}
+
+function computeWeeklyInvoicesSunSat_(srcSS, now, n = 4, includeCurrent = true) {
+  const tz    = TIMEZONE || Session.getScriptTimeZone() || 'Asia/Dhaka';
+  const invSh = srcSS.getSheetByName(INVOICE_SHEET_NAME);
+  if (!invSh || invSh.getLastRow() < 2) return [];
+
+  const ilc = invSh.getLastColumn();
+  const IH  = invSh.getRange(1,1,1,ilc).getValues()[0].map(s => String(s).trim().toLowerCase());
+  const iDate = IH.indexOf('date');
+  const tryCols = ['total','grand total','grand_total','invoice total','invoice_total','amount','total amount','total_amount','subtotal','sub_total','balance'];
+  let iTotal = -1;
+  for (const name of tryCols) {
+    const idx = IH.indexOf(name);
+    if (idx !== -1) { iTotal = idx; break; }
+  }
+  if (iDate === -1 || iTotal === -1) return [];
+
+  const vals = invSh.getRange(2,1,invSh.getLastRow()-1,ilc).getValues();
+  const rows = vals.map(r => ({
+    date: asDate0_(r[iDate]),
+    amt:  toNum_(r[iTotal])
+  })).filter(x => !!x.date && x.amt > 0);
+
+  const sunThis   = currentWeekSundayStart_(now, tz);
+  const wk1End    = addDaysEnd_(sunThis, -1);
+  const wk1Start  = addDays0_(wk1End, -6);
+  const wk2End    = addDaysEnd_(wk1End, -7);
+  const wk2Start  = addDays0_(wk2End, -6);
+  const wk3End    = addDaysEnd_(wk2End, -7);
+  const wk3Start  = addDays0_(wk3End, -6);
+
+  const sumInWindow = (start, end) => {
+    const s = start.getTime(), e = end.getTime();
+    let sum = 0;
+    for (const r of rows) {
+      const t = r.date.getTime();
+      if (t >= s && t <= e) sum += Math.max(0, r.amt);
+    }
+    return Math.round(sum);
+  };
+
+  const label = (start, end) =>
+    'From ' + Utilities.formatDate(start, tz, 'dd-MMM-yy') +
+    ' to ' + Utilities.formatDate(end, tz, 'dd-MMM-yy');
+
+  const w3 = { label: label(wk3Start, wk3End), amount: sumInWindow(wk3Start, wk3End) };
+  const w2 = { label: label(wk2Start, wk2End), amount: sumInWindow(wk2Start, wk2End) };
+  const w1 = { label: label(wk1Start, wk1End), amount: sumInWindow(wk1Start, wk1End) };
+  const thisWeek = {
+    label: 'From ' + Utilities.formatDate(sunThis, tz, 'dd-MMM-yy') +
+           ' to ' + Utilities.formatDate(now, tz, 'dd-MMM-yy'),
+    amount: sumInWindow(sunThis, now)
+  };
+
+  return [thisWeek, w1, w2, w3];
+
+  function toNum_(v){ return (typeof v==='number') ? v : Number(String(v ?? '').replace(/[, ]/g,'')) || 0; }
+  function asDate0_(v){
+    if (v instanceof Date){ const d=new Date(v); d.setHours(0,0,0,0); return isNaN(d)?null:d; }
+    const s=String(v??'').trim(); if(!s) return null;
+    const d=new Date(s); if(isNaN(d)) return null;
+    d.setHours(0,0,0,0); return d;
+  }
+  function addDays0_(d, n){ const x=new Date(d); x.setDate(x.getDate()+n); x.setHours(0,0,0,0); return x; }
+  function addDaysEnd_(d, n){ const x=new Date(d); x.setDate(x.getDate()+n); x.setHours(23,59,59,999); return x; }
+  function currentWeekSundayStart_(now, tz){
+    const y = Utilities.formatDate(now, tz, 'yyyy');
+    const m = Utilities.formatDate(now, tz, 'MM');
+    const dd = Utilities.formatDate(now, tz, 'dd');
+    const localMid = new Date(`${y}-${m}-${dd}T00:00:00`);
+    const u = Number(Utilities.formatDate(localMid, tz, 'u'));
+    const dow = (u % 7);
+    const back = (dow >= 0) ? dow : 0;
+    localMid.setDate(localMid.getDate() - back);
+    const y2 = Utilities.formatDate(localMid, tz, 'yyyy');
+    const m2 = Utilities.formatDate(localMid, tz, 'MM');
+    const d2 = Utilities.formatDate(localMid, tz, 'dd');
+    return new Date(`${y2}-${m2}-${d2}T00:00:00`);
+  }
+}
+
+/***** ======================= FORMATTERS & SHARED HELPERS ======================= */
+function fmtBDT_(n) {
+  if (n === '' || n == null || isNaN(n)) return '—';
+  return Utilities.formatString('%s', (Math.round(n)).toLocaleString('en-IN'));
+}
+function fmtBDT_plain_(n) {
+  if (n === '' || n == null || isNaN(n)) return '-';
+  return (Math.round(n)).toLocaleString('en-IN');
+}
+function fmtPct_(v) {
+  if (v === '' || v == null || isNaN(v)) return '—';
+  return Utilities.formatString('%s', (v*100).toFixed(0) + '%');
+}
+function fmtPct_plain_(v) {
+  if (v === '' || v == null || isNaN(v)) return '-';
+  return (v*100).toFixed(0) + '%';
+}
+
+function addGridBorders_(range) {
+  range.setBorder(true, true, true, true, true, true);
+}
+
+function styleHeader_(sheet, atRow, cols) {
+  sheet.getRange(atRow, 1, 1, cols)
+    .setFontColor('#ffffff')
+    .setBackground('#ff0000')
+    .setHorizontalAlignment('center')
+    .setVerticalAlignment('middle')
+    .setFontWeight('bold');
+}
+
+function remarkLabel_(d, up, down, flat){
+  if (d>0) return up;
+  if (d<0) return down;
+  return flat;
+}
+
+function riskLabel_(pct90, dso){
+  if (dso >= 91 || pct90 >= 0.60) return 'Critical';
+  if (dso >= 75 || pct90 >= 0.45) return 'High';
+  if (dso >= 60 || pct90 >= 0.25) return 'Moderate';
+  return 'Low';
+}
+
+function isBadSalesLabel_(s) {
+  const x = String(s || '').trim().replace(/\s+/g,' ');
+  if (!x) return true;
+  return /^(sales\s*person|salesperson(?:\s* name)?|total)$/i.test(x);
+}
+
+function addDays_(d, n){
+  const x = new Date(d);
+  x.setDate(x.getDate()+n);
+  x.setHours(0,0,0,0);
+  return x;
+}
+
+function mostRecentThursdayEnd_(now, tz) {
+  const y = Utilities.formatDate(now, tz, 'yyyy');
+  const m = Utilities.formatDate(now, tz, 'MM');
+  const d = Utilities.formatDate(now, tz, 'dd');
+  const localMid = new Date(`${y}-${m}-${d}T00:00:00`);
+  const u   = Number(Utilities.formatDate(localMid, tz, 'u')); // 1..7
+  const dow = (u % 7); // Sun=0..Sat=6; Thu=4
+  const targetDow = 4;
+  const back = (dow >= targetDow) ? (dow - targetDow) : (7 - (targetDow - dow));
+  localMid.setDate(localMid.getDate() - back);
+  const y2 = Utilities.formatDate(localMid, tz, 'yyyy');
+  const m2 = Utilities.formatDate(localMid, tz, 'MM');
+  const d2 = Utilities.formatDate(localMid, tz, 'dd');
+  return new Date(`${y2}-${m2}-${d2}T23:59:59.999`);
+}
+
+function exportSheetsToPdf_All_({
+  spreadsheetId,
+  fileName,
+  landscape = true,
+  fitToWidth = true,
+  printGridlines = false,
+  pageSize = 'A4'
+}) {
+  const base = 'https://docs.google.com/spreadsheets/d/' + encodeURIComponent(spreadsheetId) + '/export';
+  const qs = '?format=pdf'
+           + '&size=' + encodeURIComponent(pageSize)
+           + '&portrait=' + (landscape ? 'false' : 'true')
+           + '&fitw=' + (fitToWidth ? 'true' : 'false')
+           + '&gridlines=' + (printGridlines ? 'true' : 'false')
+           + '&printtitle=false'
+           + '&sheetnames=true'
+           + '&pagenum=LEFT'
+           + '&fzr=true';
+  const url = base + qs;
+
+  const token = ScriptApp.getOAuthToken();
+  SpreadsheetApp.flush(); Utilities.sleep(800);
+
+  let res = UrlFetchApp.fetch(url, { headers: { Authorization: 'Bearer ' + token }, muteHttpExceptions: true });
+  if (res.getResponseCode() >= 500) {
+    Utilities.sleep(1200);
+    res = UrlFetchApp.fetch(url, { headers: { Authorization: 'Bearer ' + token }, muteHttpExceptions: true });
+  }
+  if (res.getResponseCode() !== 200) {
+    throw new Error('PDF export failed: ' + res.getResponseCode() + ' ' + res.getContentText());
+  }
+  return res.getBlob().setName(fileName || 'report.pdf');
+}
