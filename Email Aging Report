@@ -58,6 +58,7 @@ function sendWeeklyAR_Bundle() {
 
   // Email body tables (includes Aging Bucket as #1)
   const srcSS = SpreadsheetApp.openById(SHEET_ID_WR);
+  logSourceSheetFreshness_(srcSS);
   const emailHtmlBlocks = buildEmailWeeklyTables_(srcSS);
   // { agingHTML, collectionsHTML, invoicesHTML, textAging, textCollections, textInvoices }
 
@@ -1133,6 +1134,72 @@ function computeAgingBucketForEmail_(srcSS) {
     clients,
     gt90Now
   };
+}
+
+function logSourceSheetFreshness_(srcSS) {
+  try {
+    const tz = TIMEZONE || Session.getScriptTimeZone() || 'Asia/Dhaka';
+    const parts = [];
+    parts.push(describeSheetFreshness_(PAYMENTS_SHEET_NAME, ['date']));
+    parts.push(describeSheetFreshness_(INVOICE_SHEET_NAME, ['date']));
+    const summary = parts.filter(Boolean).join(' | ');
+    if (summary) {
+      console.log(`[Weekly AR] Source freshness — ${summary}`);
+    }
+  } catch (err) {
+    console.log('logSourceSheetFreshness_ failed:', err && err.message);
+  }
+
+  function describeSheetFreshness_(sheetName, dateHeaders) {
+    const sh = srcSS.getSheetByName(sheetName);
+    if (!sh) return `${sheetName}: missing`;
+
+    const lastRow = sh.getLastRow();
+    const lastCol = sh.getLastColumn();
+    if (lastRow < 2 || lastCol < 1) return `${sheetName}: empty`;
+
+    const headers = sh.getRange(1, 1, 1, lastCol).getValues()[0]
+      .map(v => String(v || '').trim().toLowerCase());
+    let dateIdx = -1;
+    for (const name of dateHeaders) {
+      const idx = headers.indexOf(name);
+      if (idx !== -1) {
+        dateIdx = idx;
+        break;
+      }
+    }
+    if (dateIdx === -1) return `${sheetName}: date column not found`;
+
+    const values = sh.getRange(2, 1, lastRow - 1, lastCol).getValues();
+    let latest = null;
+    let counted = 0;
+    for (const row of values) {
+      const dt = normalizeDateForFreshness_(row[dateIdx]);
+      if (!dt) continue;
+      counted++;
+      if (!latest || dt.getTime() > latest.getTime()) {
+        latest = dt;
+      }
+    }
+
+    if (!latest || counted === 0) return `${sheetName}: no valid dates`;
+    return `${sheetName}: ${Utilities.formatDate(latest, tz, 'dd-MMM-yyyy')} (${counted} rows)`;
+  }
+
+  function normalizeDateForFreshness_(value) {
+    if (value instanceof Date) {
+      const d = new Date(value);
+      if (isNaN(d)) return null;
+      d.setHours(0, 0, 0, 0);
+      return d;
+    }
+    const str = String(value ?? '').trim();
+    if (!str) return null;
+    const parsed = new Date(str);
+    if (isNaN(parsed)) return null;
+    parsed.setHours(0, 0, 0, 0);
+    return parsed;
+  }
 }
 
 // HTML tables: Arial 13, red header, BLACK borders
