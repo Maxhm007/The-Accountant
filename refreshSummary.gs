@@ -243,6 +243,13 @@ function refreshSummary() {
 
   if (colCode == null) return safeWrite_([], ACTION_LIST, 'Missing TRADING CODE in LTP');
 
+  const MIN_LTP_E_FILTER = 5.00;
+  const ltpColEIndex = 4; // Column E (1-indexed) in LTP sheet
+  function ltpFromColumnE_(row){
+    const v = (colLtpPx != null) ? toNum(row[colLtpPx]) : toNum(row[ltpColEIndex]);
+    return Number.isFinite(v) ? v : NaN;
+  }
+
   const ltpVals = ltp.getRange(2,1,lr-1,lc).getValues(); DBG.ltpRows = ltpVals.length;
   const LTP_CODES = new Set(ltpVals.map(r => norm(r[colCode])).filter(Boolean));
 
@@ -456,6 +463,8 @@ function refreshSummary() {
   const itemsList = [];
   for (const r of ltpVals) {
     const code = norm(r[colCode]); if (!code) continue;
+    const ltpFromColE = ltpFromColumnE_(r);
+    if (!(Number.isFinite(ltpFromColE) && ltpFromColE > MIN_LTP_E_FILTER)) continue;
     const series = seriesByCode[code]; if (!series || !series.length) continue;
     const s = lightStats.get(code); if (!s) continue;
 
