@@ -302,7 +302,9 @@ function refreshSummary() {
   }
   for (const k in seriesByCode) seriesByCode[k].sort((a,b)=>a.ms-b.ms);
 
-  const isHolidayToday = (!isTradingDayBD_() || !hasHDataToday);
+  // Missing same-day HData during market hours should fall back to LTP,
+  // not be treated as a market holiday.
+  const isHolidayToday = !isTradingDayBD_();
   const todaySource    = ((AFTER_1430 && isTradingDayBD_()) || hasHDataToday) ? 'HData' : 'LTP';
 
   const buyDateDefault  = chooseBuyDate_();
